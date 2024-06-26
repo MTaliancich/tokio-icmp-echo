@@ -1,6 +1,6 @@
 [package]
 name = "tokio-icmp-echo"
-version = "0.4.1"
+version = "0.4.2"
 license = "MIT/Apache-2.0"
 authors = ["Fedor Gogolev <knsd@knsd.net>", "Jan Christian Grünhage <jan.christian@gruenhage.xyz"]
 documentation = "https://docs.rs/tokio-icmp-echo"
@@ -13,12 +13,12 @@ edition = "2021"
 [dependencies]
 futures = "0.3"
 libc = "0.2"
-mio = { version = "0.8", features = ["os-ext"] }
+mio = { version = "1", features = ["os-ext"] }
 rand = "0.8"
-socket2 = { version = "0.4", features = ["all"] }
-tokio = { version = "1", features = ["rt", "time", "net"] }
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", git = "https://github.com/MTaliancich/tokio.git", rev = "18d8292", features = ["rt", "time", "net"] }
 parking_lot = "0.12"
 thiserror = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", git = "https://github.com/MTaliancich/tokio.git", rev = "18d8292", features = ["rt-multi-thread", "time", "macros"] }
