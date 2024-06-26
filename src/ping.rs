@@ -128,9 +128,13 @@ impl Pinger {
                     let x = socket.recv(&mut buffer).await;
                     if let Ok(bytes) = x {
                         if let Some(payload) = IcmpV4::reply_payload(&buffer[..bytes]) {
-                            if let Some(sender) = state.state.remove(payload) {
-                                let _ = sender.send(()).await;
-                            }
+                            let state = state.clone();
+                            let payload = payload.to_vec();
+                            tokio::spawn(async move {
+                                if let Some(sender) = state.state.remove(&payload) {
+                                    let _ = sender.send(()).await;
+                                }
+                            });
                         }
                     }
                 }
