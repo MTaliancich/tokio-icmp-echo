@@ -1,4 +1,5 @@
+pub use self::tokio::{Socket};
+
 mod mio;
 mod tokio;
 
-pub use self::tokio::{Send, Socket};

@@ -1,11 +1,9 @@
 use std::io;
-
+use std::io::Read;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use std::io::Read;
-
-use mio::unix::SourceFd;
 use mio::{event::Source, Interest, Registry, Token};
+use mio::unix::SourceFd;
 use socket2::{Domain, Protocol, SockAddr, Socket as Socket2, Type};
 
 pub struct Socket {

@@ -25,10 +25,11 @@
 //! }
 //! ```
 
+pub use errors::Error;
+pub use ping::{Pinger, PingFutureKind};
+
 mod errors;
 mod packet;
 mod ping;
 mod socket;
 
-pub use errors::Error;
-pub use ping::{PingChain, PingChainStream, PingFuture, Pinger};

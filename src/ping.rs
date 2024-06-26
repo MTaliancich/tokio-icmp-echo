@@ -1,236 +1,53 @@
-use std::io;
-
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
-use futures::channel::oneshot;
-use futures::future::{select, Future, FutureExt};
-use futures::stream::Stream;
 use parking_lot::Mutex;
 use rand::random;
 use socket2::{Domain, Protocol, Type};
+use tokio::time::timeout;
 
-use tokio::time::{sleep_until, Sleep};
-
-use crate::packet::{EchoReply, EchoRequest, IcmpV4, IcmpV6, ICMP_HEADER_SIZE};
-use crate::packet::{IpV4Packet, IpV4Protocol};
-use crate::socket::{Send, Socket};
 use crate::Error;
+use crate::packet::{EchoReply, EchoRequest, ICMP_HEADER_SIZE, IcmpV4, IcmpV6};
+use crate::packet::{IpV4Packet, IpV4Protocol};
+use crate::socket::Socket;
 
-const DEFAULT_TIMEOUT: u64 = 2;
 const TOKEN_SIZE: usize = 24;
 const ECHO_REQUEST_BUFFER_SIZE: usize = ICMP_HEADER_SIZE + TOKEN_SIZE;
 type Token = [u8; TOKEN_SIZE];
-type EchoRequestBuffer = [u8; ECHO_REQUEST_BUFFER_SIZE];
 
-#[derive(Clone)]
+#[repr(transparent)]
 struct PingState {
-    inner: Arc<Mutex<HashMap<Token, oneshot::Sender<Instant>>>>,
+    inner: Mutex<HashMap<Token, kanal::OneshotAsyncSender<()>>>,
 }
 
 impl PingState {
     fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Mutex::new(HashMap::new()),
         }
     }
 
-    fn insert(&self, key: Token, value: oneshot::Sender<Instant>) {
+    fn insert(&self, key: Token, value: kanal::OneshotAsyncSender<()>) {
         self.inner.lock().insert(key, value);
     }
 
-    fn remove(&self, key: &[u8]) -> Option<oneshot::Sender<Instant>> {
+    fn remove(&self, key: &[u8]) -> Option<kanal::OneshotAsyncSender<()>> {
         self.inner.lock().remove(key)
     }
 }
 
-/// Represent a future that resolves into ping response time, resolves into `None` if timed out.
-#[must_use = "futures do nothing unless polled"]
-pub struct PingFuture {
-    inner: PingFutureKind,
-}
-
-enum PingFutureKind {
-    Normal(Box<NormalPingFutureKind>),
+#[derive(Debug)]
+pub enum PingFutureKind {
+    Normal(Duration),
+    NoResponse,
+    PacketSendError,
     PacketEncodeError,
     InvalidProtocol,
-}
-
-struct NormalPingFutureKind {
-    start_time: Instant,
-    state: PingState,
-    token: Token,
-    sleep: Pin<Box<Sleep>>,
-    send: Option<Send<EchoRequestBuffer>>,
-    receiver: oneshot::Receiver<Instant>,
-}
-
-impl Future for PingFuture {
-    type Output = Result<Option<Duration>, Error>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.inner {
-            PingFutureKind::Normal(ref mut normal) => {
-                let mut swap_send = false;
-
-                if let Some(ref mut send) = normal.send {
-                    match Pin::new(send).poll(cx) {
-                        Poll::Pending => (),
-                        Poll::Ready(Ok(_)) => swap_send = true,
-                        Poll::Ready(Err(_)) => return Poll::Ready(Err(Error::InternalError)),
-                    }
-                }
-
-                if swap_send {
-                    normal.send = None;
-                }
-
-                match Pin::new(&mut normal.receiver).poll(cx) {
-                    Poll::Pending => (),
-                    Poll::Ready(Ok(stop_time)) => {
-                        return Poll::Ready(Ok(Some(stop_time - normal.start_time)))
-                    }
-                    Poll::Ready(Err(_)) => return Poll::Ready(Err(Error::InternalError)),
-                }
-
-                match normal.sleep.as_mut().poll(cx) {
-                    Poll::Pending => (),
-                    Poll::Ready(_) => return Poll::Ready(Ok(None)),
-                }
-            }
-            PingFutureKind::InvalidProtocol => return Poll::Ready(Err(Error::InvalidProtocol)),
-            PingFutureKind::PacketEncodeError => return Poll::Ready(Err(Error::InternalError)),
-        }
-        Poll::Pending
-    }
-}
-
-impl Drop for PingFuture {
-    fn drop(&mut self) {
-        match self.inner {
-            PingFutureKind::Normal(ref normal) => {
-                normal.state.remove(&normal.token);
-            }
-            PingFutureKind::InvalidProtocol | PingFutureKind::PacketEncodeError => (),
-        }
-    }
-}
-
-/// Ping the same host several times.
-pub struct PingChain {
-    pinger: Pinger,
-    hostname: IpAddr,
-    ident: Option<u16>,
-    seq_cnt: Option<u16>,
-    timeout: Option<Duration>,
-}
-
-impl PingChain {
-    fn new(pinger: Pinger, hostname: IpAddr) -> Self {
-        Self {
-            pinger,
-            hostname,
-            ident: None,
-            seq_cnt: None,
-            timeout: None,
-        }
-    }
-
-    /// Set ICMP ident. Default value is randomized.
-    pub fn ident(mut self, ident: u16) -> Self {
-        self.ident = Some(ident);
-        self
-    }
-
-    /// Set ICMP seq_cnt, this value will be incremented by one for every `send`.
-    /// Default value is 0.
-    pub fn seq_cnt(mut self, seq_cnt: u16) -> Self {
-        self.seq_cnt = Some(seq_cnt);
-        self
-    }
-
-    /// Set ping timeout. Default timeout is two seconds.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Send ICMP request and wait for response.
-    pub fn send(&mut self) -> PingFuture {
-        let ident = match self.ident {
-            Some(ident) => ident,
-            None => {
-                let ident = random();
-                self.ident = Some(ident);
-                ident
-            }
-        };
-
-        let seq_cnt = match self.seq_cnt {
-            Some(seq_cnt) => {
-                self.seq_cnt = Some(seq_cnt.wrapping_add(1));
-                seq_cnt
-            }
-            None => {
-                self.seq_cnt = Some(1);
-                0
-            }
-        };
-
-        let timeout = match self.timeout {
-            Some(timeout) => timeout,
-            None => {
-                let timeout = Duration::from_secs(DEFAULT_TIMEOUT);
-                self.timeout = Some(timeout);
-                timeout
-            }
-        };
-
-        self.pinger.ping(self.hostname, ident, seq_cnt, timeout)
-    }
-
-    /// Create infinite stream of ping response times.
-    pub fn stream(self) -> PingChainStream {
-        PingChainStream::new(self)
-    }
-}
-
-/// Stream of sequential ping response times, iterates `None` if timed out.
-pub struct PingChainStream {
-    chain: PingChain,
-    future: Option<Pin<Box<PingFuture>>>,
-}
-
-impl PingChainStream {
-    fn new(chain: PingChain) -> Self {
-        Self {
-            chain,
-            future: None,
-        }
-    }
-}
-
-impl Stream for PingChainStream {
-    type Item = Result<Option<Duration>, Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut future = self
-            .future
-            .take()
-            .unwrap_or_else(|| Box::pin(self.chain.send()));
-
-        match future.as_mut().poll(cx) {
-            Poll::Ready(result) => Poll::Ready(Some(result)),
-            Poll::Pending => {
-                self.future = Some(future);
-                Poll::Pending
-            }
-        }
-    }
 }
 
 /// ICMP packets sender and receiver.
@@ -241,9 +58,14 @@ pub struct Pinger {
 
 struct PingInner {
     sockets: Sockets,
+    alive: Arc<AtomicBool>,
     state: PingState,
-    _v4_finalize: Option<oneshot::Sender<()>>,
-    _v6_finalize: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for PingInner {
+    fn drop(&mut self) {
+        self.alive.store(false, Relaxed)
+    }
 }
 
 enum Sockets {
@@ -291,52 +113,61 @@ impl Pinger {
 
         let state = PingState::new();
 
-        let v4_finalize = if let Some(v4_socket) = sockets.v4() {
-            let (s, r) = oneshot::channel();
-            let receiver = Receiver::<IcmpV4>::new(v4_socket.clone(), state.clone());
-            tokio::spawn(select(receiver, r).map(|_| ()));
-            Some(s)
-        } else {
-            None
-        };
-
-        let v6_finalize = if let Some(v6_socket) = sockets.v6() {
-            let (s, r) = oneshot::channel();
-            let receiver = Receiver::<IcmpV6>::new(v6_socket.clone(), state.clone());
-            tokio::spawn(select(receiver, r).map(|_| ()));
-            Some(s)
-        } else {
-            None
-        };
-
-        let inner = PingInner {
+        let inner = Arc::new(PingInner {
             sockets,
+            alive: Arc::new(AtomicBool::new(true)),
             state,
-            _v4_finalize: v4_finalize,
-            _v6_finalize: v6_finalize,
-        };
+        });
+
+        let state = inner.clone();
+        if state.sockets.v4().is_some() {
+            tokio::spawn(async move {
+                let mut buffer = [0; 2048];
+                let socket = state.sockets.v4().unwrap();
+                while state.alive.load(Relaxed) {
+                    let x = socket.recv(&mut buffer).await;
+                    if let Ok(bytes) = x {
+                        if let Some(payload) = IcmpV4::reply_payload(&buffer[..bytes]) {
+                            if let Some(sender) = state.state.remove(payload) {
+                                let _ = sender.send(()).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let state = inner.clone();
+        if state.sockets.v6().is_some() {
+            tokio::spawn(async move {
+                let mut buffer = [0; 2048];
+                let socket = state.sockets.v6().unwrap();
+                while state.alive.load(Relaxed) {
+                    let x = socket.recv(&mut buffer).await;
+                    if let Ok(bytes) = x {
+                        if let Some(payload) = IcmpV6::reply_payload(&buffer[..bytes]) {
+                            if let Some(sender) = state.state.remove(payload) {
+                                let _ = sender.send(()).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         Ok(Self {
-            inner: Arc::new(inner),
+            inner,
         })
     }
 
-    /// Ping the same host several times.
-    pub fn chain(&self, hostname: IpAddr) -> PingChain {
-        PingChain::new(self.clone(), hostname)
-    }
-
     /// Send ICMP request and wait for response.
-    pub fn ping(
+    pub async fn ping(
         &self,
         hostname: IpAddr,
         ident: u16,
         seq_cnt: u16,
-        timeout: Duration,
-    ) -> PingFuture {
-        let (sender, receiver) = oneshot::channel();
-
-        let deadline = Instant::now() + timeout;
+        timeout_duration: Duration,
+    ) -> PingFutureKind {
+        let (sender, receiver) = kanal::oneshot_async();
 
         let token = random();
         self.inner.state.insert(token, sender);
@@ -367,37 +198,30 @@ impl Pinger {
         let socket = match mb_socket {
             Some(socket) => socket,
             None => {
-                return PingFuture {
-                    inner: PingFutureKind::InvalidProtocol,
-                }
+                return PingFutureKind::InvalidProtocol
             }
         };
 
         if encode_result.is_err() {
-            return PingFuture {
-                inner: PingFutureKind::PacketEncodeError,
-            };
+            return PingFutureKind::PacketEncodeError;
         }
 
-        let send_future = socket.send_to(buffer, &dest);
-
-        PingFuture {
-            inner: PingFutureKind::Normal(Box::new(NormalPingFutureKind {
-                start_time: Instant::now(),
-                state: self.inner.state.clone(),
-                token,
-                sleep: Box::pin(sleep_until(deadline.into())),
-                send: Some(send_future),
-                receiver,
-            })),
+        let send_future = socket.send_to(buffer, &dest).await;
+        let start_time = Instant::now();
+        if send_future.is_err() {
+            return PingFutureKind::PacketSendError;
         }
+        let res = timeout(timeout_duration, receiver.recv()).await;
+        let elapsed = start_time.elapsed();
+        if res.is_err() {
+            return PingFutureKind::NoResponse;
+        }
+        let res = res.unwrap();
+        if res.is_err() {
+            return PingFutureKind::NoResponse;
+        }
+        PingFutureKind::Normal(elapsed)
     }
-}
-
-struct Receiver<Message> {
-    socket: Socket,
-    state: PingState,
-    _phantom: ::std::marker::PhantomData<Message>,
 }
 
 trait ParseReply {
@@ -425,36 +249,5 @@ impl ParseReply for IcmpV6 {
             return Some(reply.payload);
         }
         None
-    }
-}
-
-impl<Proto> Receiver<Proto> {
-    fn new(socket: Socket, state: PingState) -> Self {
-        Self {
-            socket,
-            state,
-            _phantom: ::std::marker::PhantomData,
-        }
-    }
-}
-
-impl<Message: ParseReply> Future for Receiver<Message> {
-    type Output = Result<(), ()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut buffer = [0; 2048];
-        match self.socket.recv(&mut buffer, cx) {
-            Poll::Ready(Ok(bytes)) => {
-                if let Some(payload) = Message::reply_payload(&buffer[..bytes]) {
-                    let now = Instant::now();
-                    if let Some(sender) = self.state.remove(payload) {
-                        sender.send(now).unwrap_or_default()
-                    }
-                }
-                self.poll(cx)
-            }
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(_)) => Poll::Ready(Err(())),
-        }
     }
 }

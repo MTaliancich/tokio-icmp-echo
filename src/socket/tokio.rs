@@ -1,11 +1,11 @@
+use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use socket2::{Domain, Protocol, SockAddr, Type};
-use std::future::Future;
-use std::net::SocketAddr;
 use tokio::io::unix::AsyncFd;
 
 use super::mio;
@@ -37,15 +37,13 @@ impl Socket {
         }
     }
 
-    pub fn recv(&self, buffer: &mut [u8], cx: &mut Context<'_>) -> Poll<Result<usize, io::Error>> {
+    pub async fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
         loop {
-            match self.socket.poll_read_ready(cx) {
-                Poll::Ready(Ok(mut guard)) => match guard.try_io(|fd| fd.get_ref().recv(buffer)) {
-                    Ok(res) => return Poll::Ready(res),
-                    Err(_) => continue,
-                },
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+            let mut guard = self.socket.readable().await?;
+
+            match guard.try_io(|fd| fd.get_ref().recv(buffer)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
             }
         }
     }

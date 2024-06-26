@@ -11,14 +11,18 @@ categories = ["network-programming", "asynchronous"]
 edition = "2021"
 
 [dependencies]
+kanal = "0.1.0-pre8"
 futures = "0.3"
 libc = "0.2"
 mio = { version = "1", features = ["os-ext"] }
 rand = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
-tokio = { version = "1", git = "https://github.com/MTaliancich/tokio.git", rev = "18d8292", features = ["rt", "time", "net"] }
+tokio = { version = "1", features = ["rt", "time", "net"] }
 parking_lot = "0.12"
 thiserror = "1"
 
 [dev-dependencies]
-tokio = { version = "1", git = "https://github.com/MTaliancich/tokio.git", rev = "18d8292", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+
+[patch.crates-io]
+tokio = { version = "1.38.1", git = "https://github.com/MTaliancich/tokio.git", rev = "18d8292" }
